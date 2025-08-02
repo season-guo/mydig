@@ -1,5 +1,5 @@
 {-# LANGUAGE InstanceSigs #-}
-module Message(testReq, testHeader, testFlag, testId, testForFlag, testForHeader, testForId, testForReq, parseReq, runDecode) where
+module Message(parseReq, runDecode, Res, getIPv4FromAdditional, getIPv4FromAns, buildReq, isAnswer, getReq, setReqNoRecursive, Req, noAdditional, getDomainFromRes, rebuildReq) where
 
 import Data.Bits
 import Data.Word (Word16, Word8, Word32)
@@ -12,14 +12,18 @@ import qualified Data.Map as Map
 
 data Id = Id Word16
     deriving Show
+
 data Flag = Flag Word16
-    deriving Show
+
 newtype QDcount = QDcount Word16
     deriving Show
+
 newtype ANcount = ANcount Word16
     deriving Show
+
 newtype NScount = NScount Word16
     deriving Show
+
 newtype ARcount = ARcount Word16
     deriving Show
 
@@ -49,6 +53,9 @@ instance HeaderSection Flag  where
     empty = Flag 0
     getBits (Flag i) = i
     changeCode op xs f = Flag $ foldl op (getBits f) xs 
+
+instance Show Flag where
+    show (Flag f) = "Flag: " ++ showHex f ""
 
 wordToByte :: Word16 -> B.ByteString
 wordToByte = B.toStrict . Builder.toLazyByteString . Builder.word16BE
@@ -103,7 +110,10 @@ decodeFlag :: (Flag -> QDcount -> ANcount -> NScount -> ARcount -> Header) -> St
 decodeFlag f = get >>= \(byte, (nowlen, domainMap)) -> put (B.drop 2 byte, (nowlen + 2, domainMap)) >> return (f $ Flag (byteToword $ B.take 2 byte))
 
 data Header = Header {tid :: Id, flag :: Flag, qdCount :: QDcount, anCount :: ANcount, nsCount :: NScount, arCount :: ARcount}
-    deriving Show
+
+instance Show Header where
+    show (Header i f qd an ns ar) =
+       "--------------------------" ++ "\nHeader:\n" ++ show i ++ "\n" ++ show f ++ "\n" ++ show qd ++ "\n" ++ show an ++ "\n" ++ show ns ++ "\n" ++ show ar ++ "\n"
 
 getIsRecursive :: Header -> Bool
 getIsRecursive = getIsFlagRecursive . flag
@@ -111,8 +121,14 @@ getIsRecursive = getIsFlagRecursive . flag
 getODcount :: Header -> Word16
 getODcount h = case qdCount h of QDcount i -> i
 
-getANScount :: Header -> Word16
-getANScount (Header _ _ _ (ANcount i) (NScount j) (ARcount k)) = i + j + k
+getAnscount :: Header -> Word16
+getAnscount (Header _ _ _ (ANcount i) _ _) = i 
+
+getNscount :: Header -> Word16
+getNscount (Header _ _ _ _ (NScount i) _) = i
+
+getArcount :: Header -> Word16 
+getArcount (Header _ _ _ _ _ (ARcount i)) = i
 
 decodeQDcount :: (QDcount -> ANcount -> NScount -> ARcount -> Header) -> State (B.ByteString, (Word16, Map.Map Word16 String)) (ANcount -> NScount -> ARcount -> Header)
 decodeQDcount f = get >>= \(byte, (nowlen, domainMap)) -> put (B.drop 2 byte, (nowlen + 2, domainMap)) >> return (f (QDcount (byteToword $ B.take 2 byte)))
@@ -133,7 +149,9 @@ decodeHeader :: State (B.ByteString, (Word16, Map.Map Word16 String))  Header
 decodeHeader = decodeId >>= decodeFlag >>= decodeQDcount >>= decodeANcount >>= decodeNScount >>= decodeARcount 
 
 data Question = Question String QRtype QRclass
-    deriving Show
+
+instance Show Question where
+    show (Question domain qtype qclass) = "--------------------------" ++ "\nQuestion:\nDomain: " ++ domain ++ "\nType: " ++ show qtype ++ "\nClass: " ++ show qclass ++ "\n"
 
 data QRtype = A | NS | CName | SOA | MX | TXT | AAAA | OPT | PRSIG | NSEC | DNSKEY | AXFR | MAILB | MAILA | ANY 
     deriving Show
@@ -143,9 +161,6 @@ data QRclass = IN | CH | HS
 
 parseDomain :: String -> B.ByteString
 parseDomain domain = (B.concat $ map (\s ->  word8ToByte (fromIntegral (length s)) <> BC.pack s) (words $ map (\c -> if c == '.' then ' ' else c) domain)) <> word8ToByte 0
-
-preDecodeDomain :: B.ByteString -> Int -> String
-preDecodeDomain domain len = if B.length domain == 0 then " " else BC.unpack (B.tail $ B.take len domain) ++ "." 
 
 decodeDomainPart :: State (B.ByteString, (Word16, Map.Map Word16 String)) String
 decodeDomainPart = get >>= \(byte, (nowlen, domainMap)) ->
@@ -223,7 +238,9 @@ decodeQuestion :: State (B.ByteString, (Word16, Map.Map Word16 String)) (Questio
 decodeQuestion = decodeDomain >>= decodeQRtype >>= decodeQRclass 
 
 data Req = Req Header Question
-    deriving Show
+
+instance Show Req where
+    show (Req h que) = show h ++ show que
 
 parseReq :: Req -> B.ByteString
 parseReq (Req h que) = B.concat [parseHeader h, parseQuestion que]
@@ -236,6 +253,15 @@ testForHeader = return . show . parseHeader
 
 testReq :: Req
 testReq = Req testHeader $ Question "leetcode.cn" A IN
+
+buildReq :: String -> Req
+buildReq domain = Req testHeader $ Question domain A IN
+
+rebuildReq :: Req -> String -> Req 
+rebuildReq (Req h _) domain = Req h (Question domain A IN)
+
+setReqNoRecursive :: Req -> Req
+setReqNoRecursive (Req h que) = Req (h {flag = setNoRecursive $ flag h}) que
 
 testForReq :: Req -> IO String
 testForReq = return . show . parseReq
@@ -272,7 +298,10 @@ data RData = ARecord IPv4 | NSRecord String | AAAARecord IPv6 | CNameRecord Stri
 data AnsDomain = Pointer String | Normal String
 
 data Answer = Answer String QRtype QRclass Word32 Word16 RData
-    deriving Show
+
+instance Show Answer where
+    show (Answer domain rtype rclass ttl rdLen rdata) = 
+       "\nAnswer:\nDomain: " ++ domain ++ "\nType: " ++ show rtype ++ "\nClass: " ++ show rclass ++ "\nTTL: " ++ show ttl ++ "\nRData Length: " ++ show rdLen ++ "\nRData: " ++ show rdata
 
 checkPtr :: B.ByteString -> Bool
 checkPtr byte = testBit (B.head byte) 7 && testBit (B.head byte) 6
@@ -321,18 +350,64 @@ decodeAns = decodeAnsDomain >>= \f ->
      >>= decodeTTL >>= \k -> get >>= \(byte'', (nowlen'', domainMap'')) -> put (B.drop 2 byte'', (nowlen'' + 2, domainMap'')) >> return (byteToword (B.take 2 byte''))
      >>= \rdLen -> return (k rdLen) >>= decodeRdata rtype
 
-data Res = Res Req [Answer]
+data ResourceRecord = AnsSection [Answer] | AuthoritySection [Answer] | AdditionalSection [Answer]
+    
+instance Show ResourceRecord where
+    show (AnsSection answers) = "--------------------------\nAnswers:\n" ++ unlines (map show answers)
+    show (AuthoritySection answers) = "--------------------------\nAuthorities:\n" ++ unlines (map show answers)
+    show (AdditionalSection answers) = "--------------------------\nAdditionals:\n" ++ unlines (map show answers)
+
+data Res = Res Req ResourceRecord ResourceRecord ResourceRecord
     deriving Show
 
 decodeAnswers :: Int -> State (B.ByteString, (Word16, Map.Map Word16 String)) [Answer]
 decodeAnswers 0 = return []
-decodeAnswers n = decodeAns >>= \ans -> decodeAnswers (n - 1) >>= \ansList -> return (ans : ansList)
+decodeAnswers n = decodeAns >>= \ans -> decodeAnswers (n - 1) >>= \rest -> return (ans : rest)
 
 decodeRes :: State (B.ByteString, (Word16, Map.Map Word16 String)) Res
 decodeRes = decodeHeader >>= \header -> 
     decodeQuestion >>= \question ->
-    decodeAnswers (fromIntegral $ getANScount header) >>=
-    return . Res (Req header question)
+    decodeAnswers (fromIntegral $ getAnscount header) >>= 
+    return . (Res (Req header question)) . AnsSection >>= \f ->
+    decodeAnswers (fromIntegral $ getNscount header) >>=
+    return . (f . AuthoritySection) >>= \g ->
+    decodeAnswers (fromIntegral $ getArcount header) >>=
+    return . (g . AdditionalSection) >>= return
 
 runDecode :: B.ByteString -> Res
 runDecode bs = fst $ runState decodeRes (bs, (1, Map.empty))
+
+onlyShowResource :: Res -> String
+onlyShowResource (Res _ ans auth add) = show ans ++ show auth ++ show add
+
+getIPv4FromResource :: [Answer] -> (Word8, Word8, Word8, Word8)
+getIPv4FromResource answers =
+    case answers of
+        [] -> error "No answers found"
+        Answer _ A _ _ _ (ARecord (IPv4 a b c d)) : _ -> (a, b, c, d)
+        _ : left -> getIPv4FromResource left
+        _ -> error "No A record found in answers section"
+
+getIPv4FromAns :: Res -> (Word8, Word8, Word8, Word8)
+getIPv4FromAns (Res _ (AnsSection answers) _ _) = getIPv4FromResource answers
+
+getIPv4FromAdditional :: Res -> (Word8, Word8, Word8, Word8)
+getIPv4FromAdditional (Res _ _ _ (AdditionalSection answers)) = getIPv4FromResource answers
+
+getDomainFromRes :: Res -> String 
+getDomainFromRes (Res _ _ authPart _) =
+    case authPart of
+        AuthoritySection [] -> error "No authority section found"
+        AuthoritySection (Answer _ _ _ _ _ (NSRecord domain) : _) -> domain
+        AuthoritySection (Answer _ _ _ _ _ (CNameRecord domain) : _) -> domain
+        _ -> error "No CNAME record found in authority section"
+
+isAnswer :: Res -> Bool 
+isAnswer (Res _ (AnsSection answers) _ _) = not $ null answers
+
+noAdditional :: Res -> Bool
+noAdditional (Res _ _ _ (AdditionalSection [])) = True
+noAdditional _ = False
+
+getReq :: Res -> B.ByteString
+getReq (Res req _ _ _) =  parseReq req
