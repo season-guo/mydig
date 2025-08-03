@@ -1,4 +1,4 @@
-module Transport(handleMsg, rootServerA, rootServerB, defaultSocket, sendUntilGetAns) where
+module Transport(handleMsg, rootServerA, rootServerB, defaultSocket, sendUntilGetAns, check) where
 
 import Control.Exception(try, SomeException)
 import Network.Socket(Socket, socket, bind, SockAddr(SockAddrInet), Family(AF_INET), SocketType(Datagram), defaultProtocol, tupleToHostAddress)
@@ -48,27 +48,34 @@ handleMsg sock msg addr = do
     handleSend sock msg addr
     handleRecv sock 1024
 
+check :: Either String a -> a
+check (Left err) = error $ "Error decoding response: " ++ err
+check (Right res) = res
+
 sendUntilGetAns :: Socket -> Res -> Req -> Bool -> IO Res
 sendUntilGetAns sock res req isTmp = do
     if isAnswer res then
         if isTmp then 
             do
-                let addr = SockAddrInet 53 (tupleToHostAddress $ getIPv4FromAns res)
-                newMsg <- handleMsg sock (parseReq req) addr
-                sendUntilGetAns sock (runDecode newMsg) req False
+                let ipv4 = check $ getIPv4FromAns res
+                case ipv4 of
+                    (a, b, c, d) -> do
+                        let addr = SockAddrInet 53 (tupleToHostAddress (a, b, c, d))
+                        newMsg <- handleMsg sock (parseReq req) addr
+                        sendUntilGetAns sock (check $ runDecode newMsg) req False
         else return res
     else if noAdditional res then
         do 
-            let domain = getDomainFromRes res
+            let domain = check $ getDomainFromRes res
             let newReq = rebuildReq req domain
             newMsg <- handleMsg sock (parseReq newReq) rootServerA
-            tmpRes <- sendUntilGetAns sock (runDecode newMsg) newReq False
+            tmpRes <- sendUntilGetAns sock (check $ runDecode newMsg) newReq False
             sendUntilGetAns sock tmpRes req True
     else 
         do
-            let addr = SockAddrInet 53 (tupleToHostAddress $ getIPv4FromAdditional res)
+            let addr = SockAddrInet 53 (tupleToHostAddress $ check $ getIPv4FromAdditional res)
             newMsg <- handleMsg sock (parseReq req) addr
-            sendUntilGetAns sock (runDecode newMsg) req False
+            sendUntilGetAns sock (check $ runDecode newMsg) req False
 
 
 rootServerA :: SockAddr
@@ -77,4 +84,18 @@ rootServerA = SockAddrInet 53 (tupleToHostAddress(198, 41, 0, 4))
 rootServerB :: SockAddr
 rootServerB = SockAddrInet 53 (tupleToHostAddress(199, 9, 14, 201))
 
+rootServerC :: SockAddr
+rootServerC = SockAddrInet 53 (tupleToHostAddress(192, 33, 4, 12))
+
+rootServerD :: SockAddr
+rootServerD = SockAddrInet 53 (tupleToHostAddress(199, 78, 55, 201))
+
+rootServerE :: SockAddr
+rootServerE = SockAddrInet 53 (tupleToHostAddress(192, 5, 5, 5))
+
+rootServerF :: SockAddr
+rootServerF = SockAddrInet 53 (tupleToHostAddress(192, 112, 36, 4))
+
+rootServers :: [SockAddr]
+rootServers = [rootServerA, rootServerB, rootServerC, rootServerD, rootServerE, rootServerF]
 

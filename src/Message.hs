@@ -6,7 +6,7 @@ import Data.Word (Word16, Word8, Word32)
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as BC
 import qualified Data.ByteString.Builder as Builder
-import Control.Monad.State(State, get, put, runState)
+import Control.Monad.State(get, put, StateT,  runStateT, lift)
 import Numeric (showHex)
 import qualified Data.Map as Map
 
@@ -30,7 +30,12 @@ newtype ARcount = ARcount Word16
 parseId :: Id -> B.ByteString
 parseId (Id i) = wordToByte i 
 
-decodeId :: State (B.ByteString, (Word16, Map.Map Word16 String)) (Flag -> QDcount -> ANcount -> NScount -> ARcount -> Header)
+type ErrStateT = StateT (B.ByteString, (Word16, Map.Map Word16 String)) (Either String)
+
+handleErr :: Either String a -> ErrStateT a
+handleErr = either (lift . Left) return
+
+decodeId :: ErrStateT (Flag -> QDcount -> ANcount -> NScount -> ARcount -> Header)
 decodeId = get >>= \(byte, (nowlen, domainMap)) -> put (B.drop 2 byte, (nowlen + 2, domainMap)) >> return (Header $ Id (byteToword $ B.take 2 byte))
 
 testId :: Id
@@ -106,7 +111,7 @@ testForFlag = return . show . parseFlag
 testFlag :: Flag
 testFlag = Flag 1
 
-decodeFlag :: (Flag -> QDcount -> ANcount -> NScount -> ARcount -> Header) -> State (B.ByteString, (Word16, Map.Map Word16 String)) (QDcount -> ANcount -> NScount -> ARcount -> Header) 
+decodeFlag :: (Flag -> QDcount -> ANcount -> NScount -> ARcount -> Header) -> ErrStateT (QDcount -> ANcount -> NScount -> ARcount -> Header) 
 decodeFlag f = get >>= \(byte, (nowlen, domainMap)) -> put (B.drop 2 byte, (nowlen + 2, domainMap)) >> return (f $ Flag (byteToword $ B.take 2 byte))
 
 data Header = Header {tid :: Id, flag :: Flag, qdCount :: QDcount, anCount :: ANcount, nsCount :: NScount, arCount :: ARcount}
@@ -130,22 +135,22 @@ getNscount (Header _ _ _ _ (NScount i) _) = i
 getArcount :: Header -> Word16 
 getArcount (Header _ _ _ _ _ (ARcount i)) = i
 
-decodeQDcount :: (QDcount -> ANcount -> NScount -> ARcount -> Header) -> State (B.ByteString, (Word16, Map.Map Word16 String)) (ANcount -> NScount -> ARcount -> Header)
+decodeQDcount :: (QDcount -> ANcount -> NScount -> ARcount -> Header) -> ErrStateT (ANcount -> NScount -> ARcount -> Header)
 decodeQDcount f = get >>= \(byte, (nowlen, domainMap)) -> put (B.drop 2 byte, (nowlen + 2, domainMap)) >> return (f (QDcount (byteToword $ B.take 2 byte)))
 
-decodeANcount :: (ANcount -> NScount -> ARcount -> Header) -> State (B.ByteString, (Word16, Map.Map Word16 String)) (NScount -> ARcount -> Header)
+decodeANcount :: (ANcount -> NScount -> ARcount -> Header) -> ErrStateT (NScount -> ARcount -> Header)
 decodeANcount f = get >>= \(byte, (nowlen, domainMap)) -> put (B.drop 2 byte, (nowlen + 2, domainMap)) >> return (f (ANcount (byteToword $ B.take 2 byte)))
 
-decodeNScount :: (NScount -> ARcount -> Header) -> State (B.ByteString, (Word16, Map.Map Word16 String)) (ARcount -> Header)
+decodeNScount :: (NScount -> ARcount -> Header) -> ErrStateT (ARcount -> Header)
 decodeNScount f = get >>= \(byte, (nowlen, domainMap)) -> put (B.drop 2 byte, (nowlen + 2, domainMap)) >> return (f (NScount (byteToword $ B.take 2 byte)))
 
-decodeARcount :: (ARcount -> Header) -> State (B.ByteString, (Word16, Map.Map Word16 String)) Header
+decodeARcount :: (ARcount -> Header) -> ErrStateT Header
 decodeARcount f = get >>= \(byte, (nowlen, domainMap)) -> put (B.drop 2 byte, (nowlen + 2, domainMap)) >> return (f (ARcount (byteToword $ B.take 2 byte)))
 
 parseHeader :: Header -> B.ByteString
 parseHeader h = B.concat [parseId $ tid h ,parseFlag $ flag h, wordToByte $ getODcount h, wordToByte $ case anCount h of ANcount i -> i, wordToByte $ case nsCount h of NScount i -> i, wordToByte $ case arCount h of ARcount i -> i]
 
-decodeHeader :: State (B.ByteString, (Word16, Map.Map Word16 String))  Header
+decodeHeader :: ErrStateT  Header
 decodeHeader = decodeId >>= decodeFlag >>= decodeQDcount >>= decodeANcount >>= decodeNScount >>= decodeARcount 
 
 data Question = Question String QRtype QRclass
@@ -162,19 +167,19 @@ data QRclass = IN | CH | HS
 parseDomain :: String -> B.ByteString
 parseDomain domain = (B.concat $ map (\s ->  word8ToByte (fromIntegral (length s)) <> BC.pack s) (words $ map (\c -> if c == '.' then ' ' else c) domain)) <> word8ToByte 0
 
-decodeDomainPart :: State (B.ByteString, (Word16, Map.Map Word16 String)) String
+decodeDomainPart :: ErrStateT String
 decodeDomainPart = get >>= \(byte, (nowlen, domainMap)) ->
     let len = fromIntegral $ B.head byte 
         domainPart = BC.unpack $ B.take (fromIntegral len) $ B.tail byte
     in put (B.drop (fromIntegral $ len + 1) byte, (nowlen + len + 1, domainMap)) >> return domainPart
 
-decodeOneDomain :: State (B.ByteString, (Word16, Map.Map Word16 String)) String
+decodeOneDomain :: ErrStateT String
 decodeOneDomain = get >>= \(_, (nowlen, _)) -> decodeDomainPart >>= \part -> 
     if null part then return "" 
     else decodeOneDomain >>= \f -> get >>= \(byte, (nowlen', domainMap)) ->
         put (byte, (nowlen', Map.insert (nowlen - 1) (part ++ "." ++ f) domainMap)) >> return (part ++ "." ++ f)
 
-decodeDomain :: State (B.ByteString, (Word16, Map.Map Word16 String)) (QRtype -> QRclass -> Question)
+decodeDomain :: ErrStateT (QRtype -> QRclass -> Question)
 decodeDomain = decodeOneDomain >>= return . Question
 
 parseQRtype :: QRtype -> Word16 
@@ -194,48 +199,48 @@ parseQRtype MAILB = 0x00FD
 parseQRtype MAILA = 0x00FE
 parseQRtype ANY = 0x00FF
 
-preDecodeQRtype :: B.ByteString -> QRtype
+preDecodeQRtype :: B.ByteString -> Either String QRtype
 preDecodeQRtype b = case byteToword b of
-    0x0001 -> A
-    0x0002 -> NS
-    0x0005 -> CName
-    0x0006 -> SOA
-    0x000F -> MX
-    0x0010 -> TXT
-    0x001C -> AAAA
-    0x0029 -> OPT
-    0x002E -> PRSIG
-    0x002F -> NSEC
-    0x0030 -> DNSKEY
-    0x00FC -> AXFR
-    0x00FD -> MAILB
-    0x00FE -> MAILA
-    0x00FF -> ANY
-    _      -> error $ "Unknown QRtype with value of" ++ show b
+    0x0001 -> Right A
+    0x0002 -> Right NS
+    0x0005 -> Right CName
+    0x0006 -> Right SOA
+    0x000F -> Right MX
+    0x0010 -> Right TXT
+    0x001C -> Right AAAA
+    0x0029 -> Right OPT
+    0x002E -> Right PRSIG
+    0x002F -> Right NSEC
+    0x0030 -> Right DNSKEY
+    0x00FC -> Right AXFR
+    0x00FD -> Right MAILB
+    0x00FE -> Right MAILA
+    0x00FF -> Right ANY
+    _ -> Left $ "Unknown QRtype: " ++ show (byteToword b)
 
-decodeQRtype :: (QRtype -> QRclass -> Question) -> State (B.ByteString, (Word16, Map.Map Word16 String)) (QRclass -> Question)
-decodeQRtype f = get >>= \(byte, (nowlen, domainMap)) -> put (B.drop 2 byte, (nowlen + 2, domainMap)) >> return (f (preDecodeQRtype $ B.take 2 byte))
+decodeQRtype :: (QRtype -> QRclass -> Question) -> ErrStateT (QRclass -> Question)
+decodeQRtype f = get >>= \(byte, (nowlen, domainMap)) -> put (B.drop 2 byte, (nowlen + 2, domainMap)) >> handleErr (preDecodeQRtype $ B.take 2 byte) >>= return . f
 
 parseQRclass :: QRclass -> Word16
 parseQRclass IN = 0x0001
 parseQRclass CH = 0x0003
 parseQRclass HS = 0x0004
 
-preDecodeQRclass :: B.ByteString -> QRclass
+preDecodeQRclass :: B.ByteString -> Either String QRclass
 preDecodeQRclass b = case byteToword b of
-    0x0001 -> IN
-    0x0003 -> CH
-    0x0004 -> HS
-    _      -> error "Unknown QRclass"
+    0x0001 -> Right IN
+    0x0003 -> Right CH
+    0x0004 -> Right HS
+    _      -> Left $ "Unknown QRclass: " ++ show (byteToword b)
 
-decodeQRclass :: (QRclass -> Question) -> State (B.ByteString, (Word16, Map.Map Word16 String)) Question
-decodeQRclass f = get >>= \(byte, (nowlen, domainMap)) -> put (B.drop 2 byte, (nowlen + 2, domainMap)) >> return (f (preDecodeQRclass $ B.take 2 byte))
+decodeQRclass :: (QRclass -> Question) -> ErrStateT Question
+decodeQRclass f = get >>= \(byte, (nowlen, domainMap)) -> put (B.drop 2 byte, (nowlen + 2, domainMap)) >> handleErr (preDecodeQRclass $ B.take 2 byte) >>= return . f
 
 parseQuestion :: Question -> B.ByteString
 parseQuestion (Question domain qtype qclass) = B.concat [parseDomain domain, wordToByte $ parseQRtype qtype, wordToByte $ parseQRclass qclass]
 
-decodeQuestion :: State (B.ByteString, (Word16, Map.Map Word16 String)) (Question)
-decodeQuestion = decodeDomain >>= decodeQRtype >>= decodeQRclass 
+decodeQuestion :: ErrStateT (Question)
+decodeQuestion = decodeDomain >>= decodeQRtype >>= decodeQRclass
 
 data Req = Req Header Question
 
@@ -277,19 +282,19 @@ instance Show IPv6 where
     show :: IPv6 -> String
     show (IPv6 a b c d e f g h) = showHex a "" ++ ":" ++ showHex b "" ++ ":" ++ showHex c "" ++ ":" ++ showHex d "" ++ ":" ++ showHex e "" ++ ":" ++ showHex f "" ++ ":" ++ showHex g "" ++ ":" ++ showHex h ""
 
-decodeIPv4 :: State (B.ByteString, (Word16, Map.Map Word16 String)) IPv4
+decodeIPv4 :: ErrStateT IPv4
 decodeIPv4 = get >>= \(byte, (nowlen, domainMap)) -> put (B.drop 4 byte, (nowlen + 4, domainMap)) >>
     case B.unpack (B.take 4 byte) of
         [a, b, c, d] -> return $ IPv4 a b c d
-        _            -> error "Invalid IPv4 address"
+        _            -> handleErr $ Left "Invalid IPv4 address"
 
-decodeIPv6 :: State (B.ByteString, (Word16, Map.Map Word16 String)) IPv6
+decodeIPv6 :: ErrStateT IPv6
 decodeIPv6 = get >>= \(byte, (nowlen, domainMap)) -> put (B.drop 16 byte, (nowlen + 16, domainMap)) >>
     case map byteToword $ [B.take 2 byte, B.take 2 $ B.drop 2 byte, B.take 2 $ B.drop 4 byte, B.take 2 $ B.drop 6 byte, B.take 2 $ B.drop 8 byte, B.take 2 $ B.drop 10 byte, B.take 2 $ B.drop 12 byte, B.take 2 $ B.drop 14 byte] of
         [a, b, c, d, e, f, g, h] -> return $ IPv6 a b c d e f g h
-        _                        -> error "Invalid IPv6 address"
+        _                        -> handleErr $ Left "Invalid IPv6 address"
 
-decodeNS :: State (B.ByteString, (Word16, Map.Map Word16 String)) String
+decodeNS :: ErrStateT String
 decodeNS = decodeOneAnsDomain
 
 data RData = ARecord IPv4 | NSRecord String | AAAARecord IPv6 | CNameRecord String
@@ -309,16 +314,16 @@ checkPtr byte = testBit (B.head byte) 7 && testBit (B.head byte) 6
 subPtr :: Word16 -> Word16
 subPtr x = x - 0xC000
 
-decodeAnsDomainPart :: State (B.ByteString, (Word16, Map.Map Word16 String)) AnsDomain
+decodeAnsDomainPart :: ErrStateT AnsDomain
 decodeAnsDomainPart = get >>= \(byte, (nowlen, domainMap)) -> 
     if not $ checkPtr byte then decodeDomainPart >>= return . Normal
-    else put (B.drop 2 byte, (nowlen + 2, domainMap)) >> return (
+    else put (B.drop 2 byte, (nowlen + 2, domainMap)) >> handleErr (
         case Map.lookup (subPtr $ byteToword $ B.take 2 byte) domainMap 
-            of Just domain -> Pointer domain
-               Nothing -> error $ "Pointer to unknown domain at position " ++ show (subPtr $ byteToword $ B.take 2 byte) ++ "\nand now map is" ++ show domainMap
+            of Just domain -> Right $ Pointer domain
+               Nothing -> Left $ "Pointer to unknown domain at position " ++ show (subPtr $ byteToword $ B.take 2 byte) ++ "\nand now map is" ++ show domainMap
         )
 
-decodeOneAnsDomain :: State (B.ByteString, (Word16, Map.Map Word16 String)) String
+decodeOneAnsDomain :: ErrStateT String
 decodeOneAnsDomain = get >>= \(_, (nowlen, _)) -> decodeAnsDomainPart >>= \part -> 
     case part of
         Normal domain -> 
@@ -327,7 +332,7 @@ decodeOneAnsDomain = get >>= \(_, (nowlen, _)) -> decodeAnsDomainPart >>= \part 
                 put (byte, (nowlen', Map.insert (nowlen - 1) (domain ++ "." ++ f) domainMap)) >> return (domain ++ "." ++ f)
         Pointer domain -> return domain
 
-decodeRdata :: QRtype -> (RData -> Answer) -> State (B.ByteString, (Word16, Map.Map Word16 String)) Answer
+decodeRdata :: QRtype -> (RData -> Answer) -> ErrStateT Answer
 decodeRdata rtype f = case rtype of
     A -> decodeIPv4 >>=  return . f . ARecord
     NS -> decodeNS >>= return . f . NSRecord
@@ -336,19 +341,19 @@ decodeRdata rtype f = case rtype of
     _ -> error "Unsupported RData type"
     
 
-decodeAnsDomain :: State (B.ByteString, (Word16, Map.Map Word16 String)) (QRtype -> QRclass -> Word32 -> Word16 -> RData -> Answer)
+decodeAnsDomain :: ErrStateT (QRtype -> QRclass -> Word32 -> Word16 -> RData -> Answer)
 decodeAnsDomain = decodeOneAnsDomain >>= return . Answer
 
-decodeTTL :: (Word32 -> Word16 -> RData -> Answer) -> State (B.ByteString, (Word16, Map.Map Word16 String)) (Word16 -> RData -> Answer)
+decodeTTL :: (Word32 -> Word16 -> RData -> Answer) -> ErrStateT (Word16 -> RData -> Answer)
 decodeTTL f = get >>= \(byte, (nowlen, domainMap)) -> put (B.drop 4 byte, (nowlen + 4, domainMap)) >> return (f (byteToword32 $ B.take 4 byte))
 
-decodeAns :: State (B.ByteString, (Word16, Map.Map Word16 String)) Answer
+decodeAns :: ErrStateT Answer
 decodeAns = decodeAnsDomain >>= \f ->
     get >>= \(byte, (nowlen, domainMap)) -> put (B.drop 2 byte, (nowlen + 2, domainMap)) >> 
-    return (preDecodeQRtype $ B.take 2 byte) >>= \rtype -> return (f rtype) 
-     >>= \g -> get >>= \(byte', (nowlen', domainMap')) -> put (B.drop 2 byte', (nowlen' + 2, domainMap')) >> return (g (preDecodeQRclass $ B.take 2 byte'))
-     >>= decodeTTL >>= \k -> get >>= \(byte'', (nowlen'', domainMap'')) -> put (B.drop 2 byte'', (nowlen'' + 2, domainMap'')) >> return (byteToword (B.take 2 byte''))
-     >>= \rdLen -> return (k rdLen) >>= decodeRdata rtype
+    return (preDecodeQRtype $ B.take 2 byte) >>= handleErr >>= \rtype -> return (f rtype) >>= \g -> get 
+    >>= \(byte', (nowlen', domainMap')) -> put (B.drop 2 byte', (nowlen' + 2, domainMap')) >> handleErr (preDecodeQRclass $ B.take 2 byte') >>= return . g
+    >>= decodeTTL >>= \k -> get >>= \(byte'', (nowlen'', domainMap'')) -> put (B.drop 2 byte'', (nowlen'' + 2, domainMap'')) >> return (byteToword (B.take 2 byte''))
+    >>= \rdLen -> return (k rdLen) >>= decodeRdata rtype
 
 data ResourceRecord = AnsSection [Answer] | AuthoritySection [Answer] | AdditionalSection [Answer]
     
@@ -360,11 +365,11 @@ instance Show ResourceRecord where
 data Res = Res Req ResourceRecord ResourceRecord ResourceRecord
     deriving Show
 
-decodeAnswers :: Int -> State (B.ByteString, (Word16, Map.Map Word16 String)) [Answer]
+decodeAnswers :: Int -> ErrStateT [Answer]
 decodeAnswers 0 = return []
 decodeAnswers n = decodeAns >>= \ans -> decodeAnswers (n - 1) >>= \rest -> return (ans : rest)
 
-decodeRes :: State (B.ByteString, (Word16, Map.Map Word16 String)) Res
+decodeRes :: ErrStateT Res  
 decodeRes = decodeHeader >>= \header -> 
     decodeQuestion >>= \question ->
     decodeAnswers (fromIntegral $ getAnscount header) >>= 
@@ -374,33 +379,33 @@ decodeRes = decodeHeader >>= \header ->
     decodeAnswers (fromIntegral $ getArcount header) >>=
     return . (g . AdditionalSection) >>= return
 
-runDecode :: B.ByteString -> Res
-runDecode bs = fst $ runState decodeRes (bs, (1, Map.empty))
+runDecode :: B.ByteString -> Either String Res
+runDecode bs = runStateT (decodeRes) (bs, (1, Map.empty)) >>= return . fst
 
 onlyShowResource :: Res -> String
 onlyShowResource (Res _ ans auth add) = show ans ++ show auth ++ show add
 
-getIPv4FromResource :: [Answer] -> (Word8, Word8, Word8, Word8)
+getIPv4FromResource :: [Answer] -> Either String (Word8, Word8, Word8, Word8)
 getIPv4FromResource answers =
     case answers of
-        [] -> error "No answers found"
-        Answer _ A _ _ _ (ARecord (IPv4 a b c d)) : _ -> (a, b, c, d)
+        [] -> Left "No answers found"
+        Answer _ A _ _ _ (ARecord (IPv4 a b c d)) : _ -> Right (a, b, c, d)
         _ : left -> getIPv4FromResource left
-        _ -> error "No A record found in answers section"
+        _ -> Left "No A record found in answers section"
 
-getIPv4FromAns :: Res -> (Word8, Word8, Word8, Word8)
+getIPv4FromAns :: Res -> Either String (Word8, Word8, Word8, Word8) 
 getIPv4FromAns (Res _ (AnsSection answers) _ _) = getIPv4FromResource answers
 
-getIPv4FromAdditional :: Res -> (Word8, Word8, Word8, Word8)
+getIPv4FromAdditional :: Res -> Either String (Word8, Word8, Word8, Word8)
 getIPv4FromAdditional (Res _ _ _ (AdditionalSection answers)) = getIPv4FromResource answers
 
-getDomainFromRes :: Res -> String 
+getDomainFromRes :: Res -> Either String String
 getDomainFromRes (Res _ _ authPart _) =
     case authPart of
-        AuthoritySection [] -> error "No authority section found"
-        AuthoritySection (Answer _ _ _ _ _ (NSRecord domain) : _) -> domain
-        AuthoritySection (Answer _ _ _ _ _ (CNameRecord domain) : _) -> domain
-        _ -> error "No CNAME record found in authority section"
+        AuthoritySection [] -> Left "No authority section found"
+        AuthoritySection (Answer _ _ _ _ _ (NSRecord domain) : _) -> Right domain
+        AuthoritySection (Answer _ _ _ _ _ (CNameRecord domain) : _) -> Right domain
+        _ -> Left "No CNAME record found in authority section"
 
 isAnswer :: Res -> Bool 
 isAnswer (Res _ (AnsSection answers) _ _) = not $ null answers
