@@ -1,5 +1,5 @@
 {-# LANGUAGE InstanceSigs #-}
-module Message(parseReq, runDecode, Res, getIPv4FromAdditional, getIPv4FromAns, buildReq, isAnswer, getReq, setReqNoRecursive, Req, noAdditional, getDomainFromRes, rebuildReq) where
+module Message(getIPv4sFromAdditional, getDomainsFromRes,getIPv4sFromAnswer, parseReq, runDecode, Res, buildReq, isAnswer, setReqNoRecursive, Req, noAdditional, rebuildReq) where
 
 import Data.Bits
 import Data.Word (Word16, Word8, Word32)
@@ -385,34 +385,37 @@ runDecode bs = runStateT (decodeRes) (bs, (1, Map.empty)) >>= return . fst
 onlyShowResource :: Res -> String
 onlyShowResource (Res _ ans auth add) = show ans ++ show auth ++ show add
 
-getIPv4FromResource :: [Answer] -> Either String (Word8, Word8, Word8, Word8)
-getIPv4FromResource answers =
+getIPv4sFromResource :: [Answer] -> [Either String (Word8, Word8, Word8, Word8)]
+getIPv4sFromResource answers =
     case answers of
-        [] -> Left "No answers found"
-        Answer _ A _ _ _ (ARecord (IPv4 a b c d)) : _ -> Right (a, b, c, d)
-        _ : left -> getIPv4FromResource left
-        _ -> Left "No A record found in answers section"
+        [] -> []
+        Answer _ A _ _ _ (ARecord (IPv4 a b c d)) : left -> Right (a, b, c, d) : getIPv4sFromResource left
+        _ : left -> getIPv4sFromResource left
 
-getIPv4FromAns :: Res -> Either String (Word8, Word8, Word8, Word8) 
-getIPv4FromAns (Res _ (AnsSection answers) _ _) = getIPv4FromResource answers
+getIPv4sFromAnswer :: Res -> [Either String (Word8, Word8, Word8, Word8)]
+getIPv4sFromAnswer (Res _ (AnsSection answers) _ _) = getIPv4sFromResource answers
+getIPv4sFromAnswer _ = [Left "No answer section found"]
 
-getIPv4FromAdditional :: Res -> Either String (Word8, Word8, Word8, Word8)
-getIPv4FromAdditional (Res _ _ _ (AdditionalSection answers)) = getIPv4FromResource answers
+getDomainsFromAnswer :: [Answer] -> [Either String String]
+getDomainsFromAnswer answers = 
+    case answers of
+            [] -> []
+            Answer _ _ _ _ _ (NSRecord domain) : left -> Right domain : getDomainsFromAnswer left
+            Answer _ _ _ _ _ (CNameRecord domain) : _ -> [Right domain]
+            _ -> [Left "No NS or CNAME record found in authority section"]
 
-getDomainFromRes :: Res -> Either String String
-getDomainFromRes (Res _ _ authPart _) =
-    case authPart of
-        AuthoritySection [] -> Left "No authority section found"
-        AuthoritySection (Answer _ _ _ _ _ (NSRecord domain) : _) -> Right domain
-        AuthoritySection (Answer _ _ _ _ _ (CNameRecord domain) : _) -> Right domain
-        _ -> Left "No CNAME record found in authority section"
+getDomainsFromRes :: Res -> [Either String String]
+getDomainsFromRes (Res _ _ (AuthoritySection answers) _) = getDomainsFromAnswer answers
+getDomainsFromRes _ = [Left "No authority section found"]
+
+getIPv4sFromAdditional :: Res -> [Either String (Word8, Word8, Word8, Word8)]
+getIPv4sFromAdditional (Res _ _ _ (AdditionalSection answers)) = getIPv4sFromResource answers
+getIPv4sFromAdditional _ = [Left "No additional section found"]
 
 isAnswer :: Res -> Bool 
 isAnswer (Res _ (AnsSection answers) _ _) = not $ null answers
+isAnswer _ = False
 
 noAdditional :: Res -> Bool
 noAdditional (Res _ _ _ (AdditionalSection [])) = True
 noAdditional _ = False
-
-getReq :: Res -> B.ByteString
-getReq (Res req _ _ _) =  parseReq req

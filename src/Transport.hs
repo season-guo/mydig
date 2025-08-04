@@ -1,10 +1,14 @@
-module Transport(handleMsg, rootServerA, rootServerB, defaultSocket, sendUntilGetAns, check) where
+module Transport(defaultDNS) where
 
 import Control.Exception(try, SomeException)
 import Network.Socket(Socket, socket, bind, SockAddr(SockAddrInet), Family(AF_INET), SocketType(Datagram), defaultProtocol, tupleToHostAddress)
 import Network.Socket.Address (recvFrom, sendTo)
 import qualified Data.ByteString as B
-import Message(parseReq, runDecode, Res, getIPv4FromAns, getIPv4FromAdditional, isAnswer, getDomainFromRes, rebuildReq, Req, noAdditional)
+import Message(buildReq ,parseReq, runDecode, Res, isAnswer, rebuildReq, Req, noAdditional, getIPv4sFromAnswer, getIPv4sFromAdditional, getDomainsFromRes)
+import Data.Word(Word8)
+
+dnsAddr :: (Word8, Word8, Word8, Word8) -> SockAddr
+dnsAddr = SockAddrInet 53 . tupleToHostAddress 
 
 initUDPSocket :: IO (Either SomeException Socket)
 initUDPSocket = try $ socket AF_INET Datagram defaultProtocol
@@ -29,54 +33,70 @@ sendMsg sock msg addr = try $ sendTo sock msg addr
 recvMsg :: Socket -> Int -> IO (Either SomeException (B.ByteString, SockAddr))
 recvMsg sock len = try $ recvFrom sock len
 
-handleSend :: Socket -> B.ByteString -> SockAddr -> IO ()
+handleSend :: Socket -> B.ByteString -> SockAddr -> IO (Either String Int)
 handleSend sock msg addr = 
     sendMsg sock msg addr >>= \result ->
     case result of
-        Left err -> putStrLn $ "Error sending message: " ++ show err
-        Right _ -> putStrLn $ "Message sent to " ++ show addr 
+        Left err -> putStrLn ("Error sending message: " ++ show err) >> return (Left "Failed to send message")
+        Right bytesSent -> putStrLn ("Message sent to " ++ show addr) >> return (Right bytesSent)
 
-handleRecv :: Socket -> Int -> IO (B.ByteString)
+handleRecv :: Socket -> Int -> IO (Either String B.ByteString)
 handleRecv sock len =
     recvMsg sock len >>= \result ->
     case result of
-        Left err -> putStrLn ("Error receiving message: " ++ show err) >> error "Failed to receive message"
-        Right (msg, addr) -> putStrLn ("Received message from " ++ show addr) >> return msg
+        Left err -> putStrLn ("Error receiving message: " ++ show err) >> return (Left "Failed to receive message")
+        Right (msg, addr) -> putStrLn ("Received message from " ++ show addr) >> return (Right msg)
 
-handleMsg :: Socket -> B.ByteString -> SockAddr -> IO B.ByteString
+handleMsg :: Socket -> B.ByteString -> SockAddr -> IO (Either String B.ByteString)
 handleMsg sock msg addr = do
-    handleSend sock msg addr
-    handleRecv sock 1024
+    sendResult <- handleSend sock msg addr
+    case sendResult of
+        Left err -> return (Left err)
+        Right _ -> handleRecv sock 1024
 
-check :: Either String a -> a
-check (Left err) = error $ "Error decoding response: " ++ err
-check (Right res) = res
+unwrap :: Either String a -> a
+unwrap (Left err) = error $ "Error decoding response: " ++ err
+unwrap (Right res) = res
 
-sendUntilGetAns :: Socket -> Res -> Req -> Bool -> IO Res
+mapUntilGet :: [Either String a] -> (a -> IO (Either String b)) -> IO (Either String b)
+mapUntilGet [] _ = return $ Left "try all but failed"
+mapUntilGet (x : left) f = 
+    case x of 
+        Left err -> putStrLn err >> mapUntilGet left f
+        Right inner -> do
+            result <- f inner
+            case result of 
+                Left err -> putStrLn err >> mapUntilGet left f
+                Right ans -> return (Right ans)
+
+
+sendUntilGetAns :: Socket -> Res -> Req -> Bool -> IO (Either String Res)
 sendUntilGetAns sock res req isTmp = do
     if isAnswer res then
         if isTmp then 
             do
-                let ipv4 = check $ getIPv4FromAns res
-                case ipv4 of
-                    (a, b, c, d) -> do
-                        let addr = SockAddrInet 53 (tupleToHostAddress (a, b, c, d))
-                        newMsg <- handleMsg sock (parseReq req) addr
-                        sendUntilGetAns sock (check $ runDecode newMsg) req False
-        else return res
+                newMsg <- mapUntilGet (getIPv4sFromAnswer res) (handleMsg sock (parseReq req) . dnsAddr)
+                sendUntilGetAns sock (unwrap $ runDecode (unwrap newMsg)) req False
+        else return $ Right res
     else if noAdditional res then
         do 
-            let domain = check $ getDomainFromRes res
-            let newReq = rebuildReq req domain
-            newMsg <- handleMsg sock (parseReq newReq) rootServerA
-            tmpRes <- sendUntilGetAns sock (check $ runDecode newMsg) newReq False
-            sendUntilGetAns sock tmpRes req True
+            newSitu <- mapUntilGet (getDomainsFromRes res) (\domain -> handleMsg sock (parseReq (rebuildReq req domain)) rootServerA >>= 
+                \result -> case result of
+                Left err -> return (Left err)
+                Right byte -> return (Right (byte, domain))
+                )
+            case newSitu of
+                Left err -> return (Left err)
+                Right (newMsg, domain) -> do
+                    let newReq = rebuildReq req domain
+                    tmpResSitu <- sendUntilGetAns sock (unwrap $ runDecode newMsg) newReq False
+                    case tmpResSitu of
+                        Left err -> putStrLn err >> return (Left err)
+                        Right tmpRes -> sendUntilGetAns sock tmpRes req True
     else 
         do
-            let addr = SockAddrInet 53 (tupleToHostAddress $ check $ getIPv4FromAdditional res)
-            newMsg <- handleMsg sock (parseReq req) addr
-            sendUntilGetAns sock (check $ runDecode newMsg) req False
-
+            newMsg <- mapUntilGet (getIPv4sFromAdditional res) (handleMsg sock (parseReq req) . dnsAddr)
+            sendUntilGetAns sock (unwrap $ runDecode (unwrap newMsg)) req False
 
 rootServerA :: SockAddr
 rootServerA = SockAddrInet 53 (tupleToHostAddress(198, 41, 0, 4))
@@ -99,3 +119,11 @@ rootServerF = SockAddrInet 53 (tupleToHostAddress(192, 112, 36, 4))
 rootServers :: [SockAddr]
 rootServers = [rootServerA, rootServerB, rootServerC, rootServerD, rootServerE, rootServerF]
 
+defaultServerDirectedDNS :: Req -> SockAddr -> IO (Either String Res)
+defaultServerDirectedDNS req addr = do
+    sock <- defaultSocket
+    initMsg <- handleMsg sock (parseReq req) addr
+    sendUntilGetAns sock (unwrap (runDecode $ unwrap initMsg)) req False
+
+defaultDNS :: String -> IO (Either String Res)
+defaultDNS domain = mapUntilGet (map Right rootServers) $ defaultServerDirectedDNS (buildReq domain)
